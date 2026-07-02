@@ -1,0 +1,505 @@
+You are building a full-stack AI-powered Resume Ranker web application using Python. Here is the complete specification:
+
+---
+
+## PROJECT OVERVIEW
+
+A web app where a recruiter can:
+1. Paste a job description
+2. Set how many top resumes to shortlist (e.g. top 10, 20, 50)
+3. Upload a ZIP file containing resumes (PDF, DOC, DOCX)
+4. Click "Run AI Ranking" — the system processes all resumes through Gemini AI and returns a ranked table
+5. Download shortlisted resumes as a ZIP or export results as CSV
+
+---
+
+## TECH STACK
+
+- **Backend**: Python, FastAPI
+- **Frontend**: Jinja2 templates + Tailwind CSS (no separate frontend framework)
+- **Resume Parsing**: pdfplumber (PDF), python-docx (DOCX), mammoth (DOC)
+- **AI**: Google Gemini API (gemini-1.5-flash) via google-generativeai SDK
+- **File handling**: Python zipfile module
+- **Database**: SQLite via SQLAlchemy
+- **Environment**: python-dotenv (.env file with GEMINI_API_KEY)
+
+---
+
+## FOLDER STRUCTURE
+resume-ranker/
+
+├── main.py
+
+├── .env                    # GEMINI_API_KEY=your_key_here
+
+├── requirements.txt
+
+├── README.md
+
+├── database.py
+
+├── core/
+
+│   ├── parser.py           # Extract text from PDF, DOCX, DOC
+
+│   ├── jd_extractor.py     # Use Gemini to extract structured JD requirements
+
+│   ├── scorer.py           # Use Gemini to score each resume against JD
+
+│   └── zipper.py           # Pack shortlisted resumes into ZIP
+
+├── routers/
+
+│   ├── upload.py           # POST /upload
+
+│   ├── results.py          # GET /results/{job_id}
+
+│   ├── status.py           # GET /status/{job_id} — polling endpoint
+
+│   └── export.py           # GET /export/{job_id}/zip and /csv
+
+├── templates/
+
+│   ├── base.html
+
+│   ├── index.html
+
+│   ├── processing.html
+
+│   └── results.html
+
+├── static/
+
+│   └── app.js
+
+└── uploads/
+
+---
+
+## AI PIPELINE (CORE LOGIC)
+
+This is the exact pipeline to implement:
+JD Text
+
+│
+
+▼
+
+Step 1: Extract JD Requirements (Gemini)
+
+│
+
+▼
+
+Step 2: For each resume:
+
+- Read resume text (parser.py)
+
+- Send JD requirements + resume text to Gemini
+
+- Gemini returns structured score JSON
+
+│
+
+▼
+
+Step 3: Store each score in SQLite
+
+│
+
+▼
+
+Step 4: Sort all scores descending
+
+│
+
+▼
+
+Step 5: Return Top N results
+
+---
+
+## STEP 1 — core/jd_extractor.py
+
+Use Gemini to extract structured requirements from raw JD text.
+
+```python
+import google.generativeai as genai
+import json, os
+from dotenv import load_dotenv
+
+load_dotenv()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+def extract_jd_requirements(jd_text: str) -> dict:
+    prompt = f"""
+You are an expert HR analyst. Extract the key requirements from this job description.
+
+Job Description:
+{jd_text}
+
+Return ONLY a valid JSON object with this exact structure:
+{{
+  "role": "Job title",
+  "required_skills": ["skill1", "skill2"],
+  "preferred_skills": ["skill1", "skill2"],
+  "experience_years": 3,
+  "education": "Bachelor's in Computer Science or related field",
+  "responsibilities": ["responsibility1", "responsibility2"],
+  "keywords": ["keyword1", "keyword2"]
+}}
+Return only JSON, no explanation, no markdown.
+"""
+    response = model.generate_content(prompt)
+    text = response.text.strip().strip("```json").strip("```").strip()
+    return json.loads(text)
+```
+
+---
+
+## STEP 2 — core/scorer.py
+
+For EACH resume, call Gemini with both JD requirements and resume text. Return structured score.
+
+```python
+import google.generativeai as genai
+import json, os, time
+from dotenv import load_dotenv
+
+load_dotenv()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+def score_resume(jd_requirements: dict, resume_text: str, candidate_name: str) -> dict:
+    prompt = f"""
+You are an expert technical recruiter. Score this resume against the job requirements.
+
+JOB REQUIREMENTS:
+{json.dumps(jd_requirements, indent=2)}
+
+RESUME:
+{resume_text[:4000]}
+
+Score this candidate and return ONLY a valid JSON object with this exact structure:
+{{
+  "candidate": "{candidate_name}",
+  "score": <overall fit score 0-100>,
+  "skills_match": <skills match score 0-100>,
+  "experience_match": <experience match score 0-100>,
+  "education_match": <education match score 0-100>,
+  "missing_skills": ["skill1", "skill2"],
+  "strengths": ["strength1", "strength2", "strength3"],
+  "summary": "One sentence summary of this candidate's fit"
+}}
+
+Scoring rules:
+- score: weighted average (skills 40%, experience 40%, education 20%)
+- skills_match: percentage of required_skills found in resume
+- experience_match: how well years/depth of experience matches
+- education_match: how well education background matches
+- missing_skills: required skills NOT found in resume
+- strengths: top 3-5 things this candidate does well for THIS role
+- Be strict and realistic. Do not inflate scores.
+
+Return only JSON, no explanation, no markdown.
+"""
+    try:
+        response = model.generate_content(prompt)
+        text = response.text.strip().strip("```json").strip("```").strip()
+        result = json.loads(text)
+        result["candidate"] = candidate_name  # always override with actual filename
+        return result
+    except Exception as e:
+        return {
+            "candidate": candidate_name,
+            "score": 0,
+            "skills_match": 0,
+            "experience_match": 0,
+            "education_match": 0,
+            "missing_skills": [],
+            "strengths": [],
+            "summary": f"Could not parse resume: {str(e)}"
+        }
+
+def score_all_resumes(jd_requirements: dict, resumes: list[dict]) -> list[dict]:
+    """
+    resumes: list of {filename, text}
+    Returns list of score dicts sorted by score descending
+    """
+    results = []
+    for i, resume in enumerate(resumes):
+        candidate_name = resume["filename"].replace("_", " ").replace("-", " ").rsplit(".", 1)[0].title()
+        print(f"Scoring {i+1}/{len(resumes)}: {candidate_name}")
+        score = score_resume(jd_requirements, resume["text"], candidate_name)
+        score["filename"] = resume["filename"]
+        score["file_path"] = resume["file_path"]
+        results.append(score)
+        time.sleep(0.5)  # avoid Gemini rate limiting
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+```
+
+---
+
+## STEP 3 — core/parser.py
+
+```python
+import pdfplumber
+from docx import Document
+import mammoth
+import os
+
+def extract_text_from_pdf(path: str) -> str:
+    try:
+        with pdfplumber.open(path) as pdf:
+            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except:
+        return ""
+
+def extract_text_from_docx(path: str) -> str:
+    try:
+        doc = Document(path)
+        return "\n".join(p.text for p in doc.paragraphs)
+    except:
+        return ""
+
+def extract_text_from_doc(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            result = mammoth.extract_raw_text(f)
+            return result.value
+    except:
+        return ""
+
+def parse_resume(path: str) -> dict:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        text = extract_text_from_pdf(path)
+    elif ext == ".docx":
+        text = extract_text_from_docx(path)
+    elif ext == ".doc":
+        text = extract_text_from_doc(path)
+    else:
+        return {"filename": os.path.basename(path), "text": "", "file_path": path, "error": "Unsupported format"}
+    return {
+        "filename": os.path.basename(path),
+        "text": text.strip(),
+        "file_path": path,
+        "error": None if text.strip() else "Could not extract text"
+    }
+
+def parse_all_resumes(folder_path: str) -> list[dict]:
+    results = []
+    for root, dirs, files in os.walk(folder_path):
+        for fname in files:
+            if fname.lower().endswith((".pdf", ".doc", ".docx")):
+                full_path = os.path.join(root, fname)
+                results.append(parse_resume(full_path))
+    return [r for r in results if r["text"]]  # skip unreadable
+```
+
+---
+
+## DATABASE SCHEMA — database.py
+
+```python
+from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import datetime
+
+SQLALCHEMY_DATABASE_URL = "sqlite:///./resume_ranker.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class JobRun(Base):
+    __tablename__ = "job_runs"
+    id = Column(String, primary_key=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    job_description = Column(Text)
+    jd_requirements = Column(Text)   # JSON string
+    shortlist_count = Column(Integer)
+    total_resumes = Column(Integer, default=0)
+    processed_resumes = Column(Integer, default=0)
+    time_taken_seconds = Column(Float, default=0)
+    status = Column(String, default="pending")  # pending, processing, done, error
+    error_message = Column(Text, nullable=True)
+
+class ResumeResult(Base):
+    __tablename__ = "resume_results"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_run_id = Column(String)
+    filename = Column(String)
+    file_path = Column(String)
+    rank = Column(Integer)
+    score = Column(Float)
+    skills_match = Column(Float)
+    experience_match = Column(Float)
+    education_match = Column(Float)
+    missing_skills = Column(Text)   # JSON string
+    strengths = Column(Text)        # JSON string
+    summary = Column(Text)
+    is_shortlisted = Column(Boolean, default=False)
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+---
+
+## UPLOAD ROUTER — routers/upload.py
+
+```python
+# POST /upload
+# 1. Accept: job_description, shortlist_count, resume_zip
+# 2. Generate job_id (UUID)
+# 3. Save & extract ZIP to uploads/{job_id}/
+# 4. Create JobRun in DB with status="processing"
+# 5. Launch background task: run_pipeline(job_id, jd_text, shortlist_count, folder)
+# 6. Immediately redirect to /processing/{job_id}
+
+# Background task: run_pipeline()
+# 1. extract_jd_requirements(jd_text) → jd_requirements dict
+# 2. parse_all_resumes(folder) → list of resume dicts
+# 3. Update JobRun.total_resumes
+# 4. score_all_resumes(jd_requirements, resumes) → scored list
+#    - After each resume scored, increment JobRun.processed_resumes (for progress bar)
+# 5. Assign ranks (1-based), mark top N as is_shortlisted=True
+# 6. Save all ResumeResult rows to DB
+# 7. Update JobRun status="done", time_taken_seconds
+```
+
+---
+
+## STATUS ENDPOINT — routers/status.py
+
+```python
+# GET /status/{job_id}
+# Returns JSON:
+# {
+#   "status": "processing",
+#   "progress_percent": 45,
+#   "message": "Scored 45 of 100 resumes...",
+#   "total": 100,
+#   "processed": 45
+# }
+# Frontend polls this every 2 seconds to update progress bar
+```
+
+---
+
+## RESULTS PAGE — templates/results.html
+
+Show a table with these columns:
+- Rank (medal icon for top 3)
+- Candidate Name
+- Overall Score (bold, color-coded: green ≥80, yellow 60-79, red <60)
+- Skills Match %
+- Experience Match %
+- Education Match %
+- Strengths (comma separated tags)
+- Missing Skills (red tags)
+- Summary (short text)
+
+Top N shortlisted rows: green left border + light green background
+Below shortlist: gray rows
+
+Buttons at top:
+- "⬇ Download Shortlisted ZIP"
+- "⬇ Export CSV"
+- "← New Search"
+
+Stats bar: "Processed 847 resumes · Shortlisted top 20 · Completed in 4m 32s"
+
+---
+
+## EXPORT — routers/export.py
+
+```python
+# GET /export/{job_id}/zip
+# — fetch all is_shortlisted=True ResumeResults for job_id
+# — pack their file_path files into an in-memory ZIP
+# — stream as download: shortlisted_resumes_{job_id}.zip
+
+# GET /export/{job_id}/csv
+# — fetch ALL ResumeResults for job_id ordered by rank
+# — stream CSV with columns:
+#   rank, candidate, score, skills_match, experience_match,
+#   education_match, strengths, missing_skills, summary, filename
+```
+
+---
+
+## PROCESSING PAGE — templates/processing.html
+
+- Spinner animation
+- Progress bar (filled via JS polling /status/{job_id})
+- Message: "Scored 23 of 100 resumes using Gemini AI..."
+- Auto-redirect to /results/{job_id} when status = "done"
+
+```javascript
+// Poll every 2 seconds
+async function poll() {
+  const res = await fetch(`/status/${jobId}`);
+  const data = await res.json();
+  document.getElementById("progress-bar").style.width = data.progress_percent + "%";
+  document.getElementById("message").innerText = data.message;
+  if (data.status === "done") window.location.href = `/results/${jobId}`;
+  else if (data.status === "error") showError(data.message);
+  else setTimeout(poll, 2000);
+}
+poll();
+```
+
+---
+
+## UI DESIGN
+
+- Tailwind CSS via CDN
+- Color scheme: white background, purple accent #7C3AED
+- Font: Inter (Google Fonts)
+- Score badges: green (#16a34a) ≥80, amber (#d97706) 60-79, red (#dc2626) <60
+- Shortlisted rows: left border-l-4 border-green-500 bg-green-50
+- Mobile responsive table (horizontal scroll on small screens)
+
+---
+
+---
+
+## IMPLEMENTATION ORDER
+
+1. requirements.txt + .env
+2. database.py
+3. core/parser.py
+4. core/jd_extractor.py
+5. core/scorer.py
+6. core/zipper.py
+7. main.py (register all routers, serve templates)
+8. routers/upload.py (with background pipeline task)
+9. routers/status.py
+10. routers/results.py
+11. routers/export.py
+12. templates/ (base → index → processing → results)
+13. README.md with setup + run instructions
+
+---
+
+## IMPORTANT NOTES
+
+- Gemini rate limit: add time.sleep(0.5) between each resume scoring call
+- Resume text: truncate to 4000 chars before sending to Gemini (saves tokens, covers most resumes)
+- Always parse JSON safely with try/except — Gemini occasionally returns malformed JSON
+- Strip ```json and ``` from Gemini responses before json.loads()
+- Candidate name: derived from filename (strip extension, replace _ and - with spaces, title case)
+- uploads/ folder: auto-cleanup files older than 24 hours on app startup
+- Run with: uvicorn main:app --reload --port 8000
+
+rank | shortlisted | candidate_name | candidate_contact | candidate_email_address |  overall_score | skills_match | experience_match | education_match | strengths | missing_skills | summary | filename | processed_at
